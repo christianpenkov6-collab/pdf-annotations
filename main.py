@@ -28,7 +28,8 @@ def is_green(color_rgb: Optional[Tuple[float, float, float]]) -> bool:
 
 def rect_from_quad_list(q: List[float]) -> fitz.Rect:
     """q = [x0,y0,x1,y1,x2,y2,x3,y3] → rect englobant"""
-    xs = q[0::2]; ys = q[1::2]
+    xs = q[0::2]
+    ys = q[1::2]
     return fitz.Rect(min(xs), min(ys), max(xs), max(ys))
 
 def add_text_from_rect(page: fitz.Page, r: fitz.Rect, texts: List[str], bboxes: List[List[float]]):
@@ -57,18 +58,17 @@ def handle_500(err):
 # ---------------------------
 @app.get("/")
 def health():
-    return jsonify({"status": "ok", "service": "pdf-annotations", "version": "1.1.0"}), 200
+    return jsonify({"status": "ok", "service": "pdf-annotations", "version": "1.2.0"}), 200
 
 @app.post("/parse")
 def parse_pdf():
     """
-    Extraction *complète* du contenu natif:
+    Extraction *complète* (PDF natif, pas d'OCR) :
     - Texte structuré (blocks/lines/spans) via rawdict (bbox, font, size, flags, color)
     - Toutes les annotations Text Markup (highlight / underline / strikeout / squiggly)
-    Ne fait PAS d'OCR (pour les scans -> OCR externe).
     """
     try:
-        # 1) Lire le PDF (binaire pur ou multipart 'file')
+        # 1) Lire PDF (binaire pur ou multipart 'file')
         if request.content_type and "application/pdf" in request.content_type.lower():
             pdf_bytes = request.get_data()
         else:
@@ -79,7 +79,7 @@ def parse_pdf():
         if not pdf_bytes:
             return jsonify({"error": "Empty request body"}), 400
 
-        # 2) Ouvrir avec PyMuPDF
+        # 2) Ouvrir PDF
         try:
             doc = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
         except Exception as e:
@@ -90,14 +90,14 @@ def parse_pdf():
         for pno in range(len(doc)):
             page = doc[pno]
 
-            # 3) Texte structuré (rawdict) – robustifié
+            # 3) rawdict (blindé)
             try:
                 raw = page.get_text("rawdict") or {}
-            except Exception as e:
+            except Exception:
                 logger.exception("rawdict failed on page %s", pno + 1)
                 raw = {}
 
-            # a) is_bold heuristique (en protégeant toutes les clés)
+            # is_bold heuristique
             try:
                 for b in raw.get("blocks", []) or []:
                     for l in b.get("lines", []) or []:
@@ -105,14 +105,10 @@ def parse_pdf():
                             font = str(s.get("font") or "").lower()
                             flags = int(s.get("flags") or 0)
                             s["is_bold"] = ("bold" in font) or (flags != 0)
-
-                # b) couleur des spans: rawdict renvoie en général un entier sRGB (RRGGBB)
-                # on laisse tel quel (JSON-safe). Si besoin de RGB 0..255:
-                # srgb = s.get("color"); if isinstance(srgb, int): rgb = fitz.sRGB_to_rgb(srgb)
             except Exception:
                 logger.exception("post-process rawdict spans failed")
 
-            # 4) Annotations: Text Markup (toutes) – robustifiées
+            # 4) Annotations text-markup (blindé)
             annots_json = []
             try:
                 annots = page.annots()
@@ -126,11 +122,11 @@ def parse_pdf():
                         if not any(k in name for k in ["highlight", "underline", "strike", "squiggly"]):
                             continue
 
-                        # couleur (pour highlight, c'est la stroke color)
+                        # couleur (highlight = stroke color)
                         color = None
                         try:
                             colors = getattr(a, "colors", None) or {}
-                            color = colors.get("stroke", None)  # ex. (r,g,b) 0..1
+                            color = colors.get("stroke", None)  # (r,g,b) 0..1 si dispo
                         except Exception:
                             pass
 
@@ -148,17 +144,17 @@ def parse_pdf():
 
                         try:
                             if v:
-                                # cas 1 : liste de fitz.Quad
+                                # liste de fitz.Quad
                                 if hasattr(v, "__len__") and len(v) > 0 and hasattr(v[0], "rect"):
                                     for q in v:
                                         add_rect(q.rect)
-                                # cas 2 : Points (4*n)
+                                # 4*n Points
                                 elif hasattr(v, "__len__") and len(v) > 0 and hasattr(v[0], "x") and hasattr(v[0], "y"):
                                     for i in range(0, len(v), 4):
                                         if i + 3 < len(v):
                                             q = fitz.Quad([v[i], v[i+1], v[i+2], v[i+3]])
                                             add_rect(q.rect)
-                                # cas 3 : liste plate 8*n
+                                # liste plate 8*n
                                 elif hasattr(v, "__len__") and len(v) >= 8 and isinstance(v[0], (int, float)):
                                     for i in range(0, len(v), 8):
                                         if i + 7 < len(v):
@@ -175,12 +171,11 @@ def parse_pdf():
 
                         annots_json.append({
                             "type": name,                               # "highlight" | "underline" | "strikeout" | "squiggly"
-                            "color_rgb": list(color) if color else None, # (r,g,b) 0..1 si fourni
+                            "color_rgb": list(color) if color else None,
                             "boxes": boxes,
                             "text": " ".join(texts).strip()
                         })
                     except Exception:
-                        # On ignore cette annotation si elle est corrompue
                         logger.exception("failed to process annotation on page %s", pno + 1)
 
             out_pages.append({
@@ -196,16 +191,14 @@ def parse_pdf():
         logger.exception("Unhandled error in /parse")
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-
 @app.post("/extract")
 def extract():
     """
-    PDF -> JSON des surlignages "Highlight" :
+    PDF -> JSON des surlignages "Highlight" uniquement :
     - binaire pur (Content-Type: application/pdf) OU multipart/form-data (champ 'file')
     - renvoie texte sous les quads + couleur + bboxes + is_green
     """
     try:
-        # Lire les octets du PDF
         if request.content_type and "application/pdf" in request.content_type.lower():
             pdf_bytes = request.get_data()
         else:
@@ -216,7 +209,6 @@ def extract():
         if not pdf_bytes:
             return jsonify({"error": "Empty request body"}), 400
 
-        # Ouvrir le PDF
         try:
             doc = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
         except Exception as e:
