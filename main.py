@@ -63,10 +63,20 @@ def health():
 @app.post("/parse")
 def parse_pdf():
     """
-    Extraction *complète* (PDF natif, pas d'OCR) :
-    - Texte structuré (blocks/lines/spans) via rawdict (bbox, font, size, flags, color)
-    - Toutes les annotations Text Markup (highlight / underline / strikeout / squiggly)
+    Extraction *complète* (PDF natif, pas d'OCR) avec garde-fous:
+    - pages=ex. "1-3,5" pour limiter les pages
+    - truncate_span=ex. 200 pour couper le texte des spans (évite >32MiB)
+    - debug=1 pour renvoyer l'exception dans la réponse JSON (diagnostic)
     """
+    import json
+
+    # --- params facultatifs ---
+    q = request.args or {}
+    pages_param = (q.get("pages") or "").strip()
+    trunc = q.get("truncate_span")
+    truncate_span = int(trunc) if (trunc and str(trunc).isdigit()) else None
+    debug = (q.get("debug") == "1")
+
     try:
         # 1) Lire PDF (binaire pur ou multipart 'file')
         if request.content_type and "application/pdf" in request.content_type.lower():
@@ -86,18 +96,45 @@ def parse_pdf():
             logger.exception("fitz.open failed (/parse)")
             return jsonify({"error": f"Failed to open PDF: {e}"}), 400
 
-        out_pages = []
-        for pno in range(len(doc)):
-            page = doc[pno]
+        # 3) Calcul des pages à traiter
+        all_nums = list(range(1, len(doc) + 1))
+        sel_nums = set()
+        if pages_param:
+            for part in pages_param.split(","):
+                part = part.strip()
+                if "-" in part:
+                    a, b = part.split("-", 1)
+                    try:
+                        a, b = int(a), int(b)
+                        for n in range(a, b + 1):
+                            if 1 <= n <= len(doc):
+                                sel_nums.add(n)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        n = int(part)
+                        if 1 <= n <= len(doc):
+                            sel_nums.add(n)
+                    except Exception:
+                        pass
+        page_numbers = sorted(sel_nums) if sel_nums else all_nums
 
-            # 3) rawdict (blindé)
+        out_pages = []
+        approx_bytes = 0  # garde-fou pour rester < ~28MiB (marge)
+        BYTES_BUDGET = 28 * 1024 * 1024
+
+        for pno in page_numbers:
+            page = doc[pno - 1]
+
+            # 4) rawdict (robuste)
             try:
                 raw = page.get_text("rawdict") or {}
             except Exception:
-                logger.exception("rawdict failed on page %s", pno + 1)
+                logger.exception("rawdict failed on page %s", pno)
                 raw = {}
 
-            # is_bold heuristique
+            # 4a) is_bold + éventuel tronquage de span
             try:
                 for b in raw.get("blocks", []) or []:
                     for l in b.get("lines", []) or []:
@@ -105,10 +142,14 @@ def parse_pdf():
                             font = str(s.get("font") or "").lower()
                             flags = int(s.get("flags") or 0)
                             s["is_bold"] = ("bold" in font) or (flags != 0)
+                            if truncate_span is not None:
+                                t = s.get("text")
+                                if isinstance(t, str) and len(t) > truncate_span:
+                                    s["text"] = t[:truncate_span]
             except Exception:
                 logger.exception("post-process rawdict spans failed")
 
-            # 4) Annotations text-markup (blindé)
+            # 5) Annotations text-markup (robuste)
             annots_json = []
             try:
                 annots = page.annots()
@@ -121,8 +162,6 @@ def parse_pdf():
                         name = (getattr(a, "typeString", "") or "").lower()
                         if not any(k in name for k in ["highlight", "underline", "strike", "squiggly"]):
                             continue
-
-                        # couleur (highlight = stroke color)
                         color = None
                         try:
                             colors = getattr(a, "colors", None) or {}
@@ -139,22 +178,21 @@ def parse_pdf():
                             except Exception:
                                 t = ""
                             if t:
+                                if truncate_span is not None and len(t) > truncate_span:
+                                    t = t[:truncate_span]
                                 texts.append(t)
                                 boxes.append([float(r.x0), float(r.y0), float(r.x1), float(r.y1)])
 
                         try:
                             if v:
-                                # liste de fitz.Quad
                                 if hasattr(v, "__len__") and len(v) > 0 and hasattr(v[0], "rect"):
                                     for q in v:
                                         add_rect(q.rect)
-                                # 4*n Points
                                 elif hasattr(v, "__len__") and len(v) > 0 and hasattr(v[0], "x") and hasattr(v[0], "y"):
                                     for i in range(0, len(v), 4):
                                         if i + 3 < len(v):
                                             q = fitz.Quad([v[i], v[i+1], v[i+2], v[i+3]])
                                             add_rect(q.rect)
-                                # liste plate 8*n
                                 elif hasattr(v, "__len__") and len(v) >= 8 and isinstance(v[0], (int, float)):
                                     for i in range(0, len(v), 8):
                                         if i + 7 < len(v):
@@ -170,26 +208,40 @@ def parse_pdf():
                                 pass
 
                         annots_json.append({
-                            "type": name,                               # "highlight" | "underline" | "strikeout" | "squiggly"
+                            "type": name,
                             "color_rgb": list(color) if color else None,
                             "boxes": boxes,
                             "text": " ".join(texts).strip()
                         })
                     except Exception:
-                        logger.exception("failed to process annotation on page %s", pno + 1)
+                        logger.exception("failed to process annotation on page %s", pno)
 
-            out_pages.append({
-                "number": pno + 1,
+            page_obj = {
+                "number": pno,
                 "size": [float(page.rect.width), float(page.rect.height)],
                 "text_raw": raw,
                 "annotations": annots_json
-            })
+            }
+            out_pages.append(page_obj)
 
-        return jsonify({"meta": {"page_count": len(doc)}, "pages": out_pages}), 200
+            # 6) garde-fou taille réponse (~28MiB)
+            try:
+                approx_bytes += len(json.dumps(page_obj, ensure_ascii=False))
+                if approx_bytes > BYTES_BUDGET:
+                    break
+            except Exception:
+                pass
+
+        resp = {"meta": {"page_count": len(doc), "returned_pages": len(out_pages)}, "pages": out_pages}
+        return jsonify(resp), 200
 
     except Exception as e:
         logger.exception("Unhandled error in /parse")
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        if (request.args or {}).get("debug") == "1":
+            # renvoie le message d'erreur pour faciliter le debug côté Make
+            return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"error": "Internal Server Error"}), 500
+
 
 @app.post("/extract")
 def extract():
