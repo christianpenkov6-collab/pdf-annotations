@@ -1,7 +1,7 @@
 import io
 import os
 import logging
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any
 
 from flask import Flask, request, jsonify
 import fitz  # PyMuPDF
@@ -12,7 +12,6 @@ import fitz  # PyMuPDF
 # ---------------------------
 app = Flask(__name__)
 
-# Logging "production-friendly"
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -60,7 +59,6 @@ def handle_404(err):
 
 @app.errorhandler(500)
 def handle_500(err):
-    # Flask loggue déjà l’exception ; on renvoie un JSON propre côté client
     return jsonify({"error": "Internal Server Error"}), 500
 
 
@@ -69,7 +67,7 @@ def handle_500(err):
 # ---------------------------
 @app.get("/")
 def health():
-    return jsonify({"status": "ok", "service": "pdf-annotations", "version": "1.0.0"}), 200
+    return jsonify({"status": "ok", "service": "pdf-annotations", "version": "1.0.1"}), 200
 
 
 @app.post("/extract")
@@ -78,7 +76,7 @@ def extract():
     Reçoit un PDF :
     - soit en binaire pur (Content-Type: application/pdf)
     - soit en multipart/form-data (champ 'file')
-    Renvoie un JSON avec tous les highlights trouvés.
+    Renvoie un JSON avec toutes les annotations 'Highlight' trouvées.
     """
     try:
         # ---- Lire les octets du PDF ----
@@ -110,21 +108,28 @@ def extract():
                 continue
 
             for annot in annots:
-                # Type highlight : code 8 (et name 'Highlight') d'après la doc PyMuPDF
-                # La couleur du highlight est un "stroke color". :contentReference[oaicite:4]{index=4}
-                try:
-                    a_type = getattr(annot, "type", (None, ""))  # (code, name)
-                except Exception:
-                    a_type = (None, "")
+                # Compat nouvelles / anciennes versions :
+                # - nouvelles : annot.type -> int (code)
+                # - anciennes : annot.type -> (code, name)
+                a_type = getattr(annot, "type", None)
+                name = getattr(annot, "typeString", "") or ""
+                code = None
+                if isinstance(a_type, int):
+                    code = a_type
+                else:
+                    try:
+                        code = a_type[0]
+                        if not name:
+                            name = (a_type[1] or "")
+                    except Exception:
+                        code = None
 
-                if not a_type:
+                # 8 = Highlight (ou name contient "Highlight")
+                is_highlight = (code == 8) or ("Highlight" in name)
+                if not is_highlight:
                     continue
 
-                code, name = a_type[0], (a_type[1] or "")
-                if not (code == 8 or "Highlight" in name):
-                    continue
-
-                # Couleur (stroke)
+                # Couleur : stroke color (PyMuPDF stocke la couleur de surlignage là)
                 color = None
                 try:
                     colors = getattr(annot, "colors", None) or {}
@@ -132,11 +137,10 @@ def extract():
                 except Exception:
                     pass
 
-                # Récupérer texte sous les quads / bbox (selon ce qui est dispo)
+                # Récupérer texte sous les quads / bbox
                 texts: List[str] = []
                 bboxes: List[List[float]] = []
 
-                # Certaines versions exposent 'vertices' comme liste plate (8*n)
                 quads = getattr(annot, "vertices", None)
                 if quads and len(quads) % 8 == 0:
                     for i in range(0, len(quads), 8):
@@ -146,7 +150,6 @@ def extract():
                             texts.append(t)
                             bboxes.append(bbox_tuple(rect))
                 else:
-                    # Fallback : bbox globale de l’annotation
                     try:
                         rect = annot.rect
                         t = page.get_text("text", clip=rect).strip()
@@ -162,15 +165,14 @@ def extract():
                 results.append({
                     "page": page_index + 1,
                     "text": " ".join(texts).strip(),
-                    "color_rgb": list(color) if color else None,  # ex. [r,g,b] in 0..1
+                    "color_rgb": list(color) if color else None,  # [r,g,b] 0..1
                     "is_green": is_green(color),
-                    "boxes": bboxes,  # liste de bboxes (une par quad)
+                    "boxes": bboxes,
                 })
 
         return jsonify({"highlights": results, "count": len(results)}), 200
 
     except Exception as e:
-        # On loggue la stack trace côté serveur et on renvoie un JSON propre
         logger.exception("Unhandled error in /extract")
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
@@ -216,6 +218,6 @@ def fulltext():
 # Entrée Cloud Run / Buildpacks
 # ---------------------------
 if __name__ == "__main__":
-    # Buildpacks / Cloud Run écoutent sur PORT (8080 par défaut) :contentReference[oaicite:5]{index=5}
+    # Buildpacks / Cloud Run : écoute sur $PORT (8080 par défaut)
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
