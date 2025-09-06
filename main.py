@@ -1,7 +1,8 @@
 import io
 import os
 import logging
-from typing import List, Optional, Tuple, Dict, Any
+from math import isfinite
+from typing import List, Optional, Tuple, Dict, Any, Union
 
 from flask import Flask, request, jsonify
 import fitz  # PyMuPDF
@@ -38,6 +39,31 @@ def add_text_from_rect(page: fitz.Page, r: fitz.Rect, texts: List[str], bboxes: 
         texts.append(t)
         bboxes.append([float(r.x0), float(r.y0), float(r.x1), float(r.y1)])
 
+def _sanitize_for_json(x: Any) -> Any:
+    """
+    Sanitize récursif pour éviter les 500 à la sérialisation JSON :
+    - remplace NaN/Inf par None
+    - convertit tuples -> listes
+    - clés dict -> str
+    """
+    if isinstance(x, float):
+        return x if isfinite(x) else None
+    if isinstance(x, (int, str, type(None), bool)):
+        return x
+    if isinstance(x, tuple):
+        return [_sanitize_for_json(v) for v in x]
+    if isinstance(x, list):
+        return [_sanitize_for_json(v) for v in x]
+    if isinstance(x, dict):
+        return {str(k): _sanitize_for_json(v) for k, v in x.items()}
+    # objets PyMuPDF (Rect, Point, Quad) -> listes/float
+    if hasattr(x, "x0") and hasattr(x, "y0") and hasattr(x, "x1") and hasattr(x, "y1"):
+        try:
+            return [float(x.x0), float(x.y0), float(x.x1), float(x.y1)]
+        except Exception:
+            return None
+    return str(x)  # dernier recours, stringify (sécurisé)
+
 # ---------------------------
 # Error Handlers → JSON
 # ---------------------------
@@ -58,7 +84,7 @@ def handle_500(err):
 # ---------------------------
 @app.get("/")
 def health():
-    return jsonify({"status": "ok", "service": "pdf-annotations", "version": "1.2.0"}), 200
+    return jsonify({"status": "ok", "service": "pdf-annotations", "version": "1.3.0"}), 200
 
 @app.post("/parse")
 def parse_pdf():
@@ -70,7 +96,6 @@ def parse_pdf():
     """
     import json
 
-    # --- params facultatifs ---
     q = request.args or {}
     pages_param = (q.get("pages") or "").strip()
     trunc = q.get("truncate_span")
@@ -78,8 +103,8 @@ def parse_pdf():
     debug = (q.get("debug") == "1")
 
     try:
-        # 1) Lire PDF (binaire pur ou multipart 'file')
-        if request.content_type and "application/pdf" in request.content_type.lower():
+        # 1) Lire PDF
+        if request.content_type and "application/pdf" in (request.content_type or "").lower():
             pdf_bytes = request.get_data()
         else:
             f = request.files.get("file")
@@ -96,7 +121,7 @@ def parse_pdf():
             logger.exception("fitz.open failed (/parse)")
             return jsonify({"error": f"Failed to open PDF: {e}"}), 400
 
-        # 3) Calcul des pages à traiter
+        # 3) Pages à traiter
         all_nums = list(range(1, len(doc) + 1))
         sel_nums = set()
         if pages_param:
@@ -120,9 +145,9 @@ def parse_pdf():
                         pass
         page_numbers = sorted(sel_nums) if sel_nums else all_nums
 
-        out_pages = []
-        approx_bytes = 0  # garde-fou pour rester < ~28MiB (marge)
-        BYTES_BUDGET = 28 * 1024 * 1024
+        out_pages: List[Dict[str, Any]] = []
+        approx_bytes = 0
+        BYTES_BUDGET = 28 * 1024 * 1024  # marge sous la limite 32 MiB Cloud Run (HTTP/1). :contentReference[oaicite:5]{index=5}
 
         for pno in page_numbers:
             page = doc[pno - 1]
@@ -134,7 +159,7 @@ def parse_pdf():
                 logger.exception("rawdict failed on page %s", pno)
                 raw = {}
 
-            # 4a) is_bold + éventuel tronquage de span
+            # 4a) is_bold + tronquage éventuel
             try:
                 for b in raw.get("blocks", []) or []:
                     for l in b.get("lines", []) or []:
@@ -150,7 +175,7 @@ def parse_pdf():
                 logger.exception("post-process rawdict spans failed")
 
             # 5) Annotations text-markup (robuste)
-            annots_json = []
+            annots_json: List[Dict[str, Any]] = []
             try:
                 annots = page.annots()
             except Exception:
@@ -162,6 +187,8 @@ def parse_pdf():
                         name = (getattr(a, "typeString", "") or "").lower()
                         if not any(k in name for k in ["highlight", "underline", "strike", "squiggly"]):
                             continue
+
+                        # couleur (highlight = stroke color) :contentReference[oaicite:6]{index=6}
                         color = None
                         try:
                             colors = getattr(a, "colors", None) or {}
@@ -186,15 +213,15 @@ def parse_pdf():
                         try:
                             if v:
                                 if hasattr(v, "__len__") and len(v) > 0 and hasattr(v[0], "rect"):
-                                    for q in v:
+                                    for q in v:  # liste de fitz.Quad
                                         add_rect(q.rect)
                                 elif hasattr(v, "__len__") and len(v) > 0 and hasattr(v[0], "x") and hasattr(v[0], "y"):
-                                    for i in range(0, len(v), 4):
+                                    for i in range(0, len(v), 4):  # Points 4*n
                                         if i + 3 < len(v):
                                             q = fitz.Quad([v[i], v[i+1], v[i+2], v[i+3]])
                                             add_rect(q.rect)
                                 elif hasattr(v, "__len__") and len(v) >= 8 and isinstance(v[0], (int, float)):
-                                    for i in range(0, len(v), 8):
+                                    for i in range(0, len(v), 8):  # liste plate 8*n
                                         if i + 7 < len(v):
                                             xs = v[i:i+8][0::2]; ys = v[i:i+8][1::2]
                                             r = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
@@ -224,24 +251,24 @@ def parse_pdf():
             }
             out_pages.append(page_obj)
 
-            # 6) garde-fou taille réponse (~28MiB)
+            # 6) garde-fou taille réponse
             try:
-                approx_bytes += len(json.dumps(page_obj, ensure_ascii=False))
+                approx_bytes += len(json.dumps(_sanitize_for_json(page_obj), ensure_ascii=False))
                 if approx_bytes > BYTES_BUDGET:
                     break
             except Exception:
                 pass
 
         resp = {"meta": {"page_count": len(doc), "returned_pages": len(out_pages)}, "pages": out_pages}
+        # Sanitize global avant retour -> évite 500 sur NaN / types non JSON
+        resp = _sanitize_for_json(resp)
         return jsonify(resp), 200
 
     except Exception as e:
         logger.exception("Unhandled error in /parse")
         if (request.args or {}).get("debug") == "1":
-            # renvoie le message d'erreur pour faciliter le debug côté Make
             return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
         return jsonify({"error": "Internal Server Error"}), 500
-
 
 @app.post("/extract")
 def extract():
@@ -251,7 +278,7 @@ def extract():
     - renvoie texte sous les quads + couleur + bboxes + is_green
     """
     try:
-        if request.content_type and "application/pdf" in request.content_type.lower():
+        if request.content_type and "application/pdf" in (request.content_type or "").lower():
             pdf_bytes = request.get_data()
         else:
             f = request.files.get("file")
@@ -276,7 +303,6 @@ def extract():
                 continue
 
             for annot in annots:
-                # type highlight (compat int / tuple)
                 a_type = getattr(annot, "type", None)
                 name = getattr(annot, "typeString", "") or ""
                 code = None
@@ -294,7 +320,6 @@ def extract():
                 if not is_highlight:
                     continue
 
-                # couleur = stroke color
                 color = None
                 try:
                     colors = getattr(annot, "colors", None) or {}
@@ -302,7 +327,6 @@ def extract():
                 except Exception:
                     pass
 
-                # texte & bboxes depuis vertices (robuste)
                 texts: List[str] = []
                 bboxes: List[List[float]] = []
                 v = getattr(annot, "vertices", None)
@@ -350,7 +374,7 @@ def extract():
 def fulltext():
     """Texte brut par page (diagnostic)."""
     try:
-        if request.content_type and "application/pdf" in request.content_type.lower():
+        if request.content_type and "application/pdf" in (request.content_type or "").lower():
             pdf_bytes = request.get_data()
         else:
             f = request.files.get("file")
