@@ -33,15 +33,18 @@ def is_green(color_rgb: Optional[Tuple[float, float, float]]) -> bool:
     return (g >= 0.6) and (g >= r + 0.10) and (g >= b + 0.10)
 
 
-def rect_from_quad(quad: List[float]) -> fitz.Rect:
-    """quad = [x0,y0,x1,y1,x2,y2,x3,y3] → rect englobant"""
-    xs = quad[0::2]
-    ys = quad[1::2]
+def rect_from_quad_list(q: List[float]) -> fitz.Rect:
+    """q = [x0,y0,x1,y1,x2,y2,x3,y3] → rect englobant"""
+    xs = q[0::2]
+    ys = q[1::2]
     return fitz.Rect(min(xs), min(ys), max(xs), max(ys))
 
 
-def bbox_tuple(rect: fitz.Rect) -> List[float]:
-    return [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)]
+def add_text_from_rect(page: fitz.Page, r: fitz.Rect, texts: List[str], bboxes: List[List[float]]):
+    t = page.get_text("text", clip=r).strip()
+    if t:
+        texts.append(t)
+        bboxes.append([float(r.x0), float(r.y0), float(r.x1), float(r.y1)])
 
 
 # ---------------------------
@@ -67,7 +70,7 @@ def handle_500(err):
 # ---------------------------
 @app.get("/")
 def health():
-    return jsonify({"status": "ok", "service": "pdf-annotations", "version": "1.0.1"}), 200
+    return jsonify({"status": "ok", "service": "pdf-annotations", "version": "1.0.2"}), 200
 
 
 @app.post("/extract")
@@ -129,7 +132,7 @@ def extract():
                 if not is_highlight:
                     continue
 
-                # Couleur : stroke color (PyMuPDF stocke la couleur de surlignage là)
+                # Couleur : stroke color (PyMuPDF)
                 color = None
                 try:
                     colors = getattr(annot, "colors", None) or {}
@@ -137,27 +140,41 @@ def extract():
                 except Exception:
                     pass
 
-                # Récupérer texte sous les quads / bbox
+                # --- TEXTE & BBOX depuis les "quads" (robuste à tous formats)
                 texts: List[str] = []
                 bboxes: List[List[float]] = []
 
-                quads = getattr(annot, "vertices", None)
-                if quads and len(quads) % 8 == 0:
-                    for i in range(0, len(quads), 8):
-                        rect = rect_from_quad(quads[i:i+8])
-                        t = page.get_text("text", clip=rect).strip()
-                        if t:
-                            texts.append(t)
-                            bboxes.append(bbox_tuple(rect))
-                else:
+                v = getattr(annot, "vertices", None)
+                try:
+                    if v:
+                        # cas 1 : liste de fitz.Quad (objets)
+                        if hasattr(v[0], "rect"):
+                            for q in v:
+                                add_text_from_rect(page, q.rect, texts, bboxes)
+
+                        # cas 2 : 4 Points (ou 4*n Points)
+                        elif hasattr(v[0], "x") and hasattr(v[0], "y"):
+                            for i in range(0, len(v), 4):
+                                if i + 3 < len(v):
+                                    q = fitz.Quad([v[i], v[i+1], v[i+2], v[i+3]])
+                                    add_text_from_rect(page, q.rect, texts, bboxes)
+
+                        # cas 3 : liste plate de nombres (8*n)
+                        elif isinstance(v[0], (int, float)):
+                            for i in range(0, len(v), 8):
+                                if i + 7 < len(v):
+                                    r = rect_from_quad_list(v[i:i+8])
+                                    add_text_from_rect(page, r, texts, bboxes)
+
+                    # fallback : bbox générale si aucun quad exploitable
+                    if not texts:
+                        add_text_from_rect(page, annot.rect, texts, bboxes)
+
+                except Exception:
                     try:
-                        rect = annot.rect
-                        t = page.get_text("text", clip=rect).strip()
-                        if t:
-                            texts.append(t)
-                            bboxes.append(bbox_tuple(rect))
+                        add_text_from_rect(page, annot.rect, texts, bboxes)
                     except Exception:
-                        logger.exception("Failed reading text for annotation")
+                        pass
 
                 if not texts:
                     continue
