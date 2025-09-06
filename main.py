@@ -1,3 +1,4 @@
+# main.py
 import io
 import os
 import logging
@@ -22,7 +23,8 @@ def is_green(color_rgb: Optional[Tuple[float, float, float]]) -> bool:
     return (g >= 0.6) and (g >= r + 0.10) and (g >= b + 0.10)
 
 def rect_from_quad_list(q: List[float]) -> fitz.Rect:
-    xs = q[0::2]; ys = q[1::2]
+    xs = q[0::2]
+    ys = q[1::2]
     return fitz.Rect(min(xs), min(ys), max(xs), max(ys))
 
 def add_text_from_rect(page: fitz.Page, r: fitz.Rect, texts: List[str], bboxes: List[List[float]]):
@@ -32,7 +34,7 @@ def add_text_from_rect(page: fitz.Page, r: fitz.Rect, texts: List[str], bboxes: 
         bboxes.append([float(r.x0), float(r.y0), float(r.x1), float(r.y1)])
 
 def _sanitize_json(x: Any) -> Any:
-    """Rend tout sérialisable JSON (remplace NaN/Inf, convertit tuples, obj PyMuPDF, etc.)."""
+    """Rend tout sérialisable JSON (NaN/Inf→None, tuples→list, Rect→bbox)."""
     if isinstance(x, float):
         return x if isfinite(x) else None
     if isinstance(x, (int, str, type(None), bool)):
@@ -50,17 +52,115 @@ def _sanitize_json(x: Any) -> Any:
             return None
     return str(x)
 
-def _spans_compacts(page: fitz.Page) -> List[Dict[str, Any]]:
-    """Texte compact: spans avec {page,block,line,span,text,bbox,font,size,is_bold,color_rgb}."""
-    d = page.get_text("dict") or {}  # plus léger que rawdict
+def _rects_overlap(r1: fitz.Rect, r2: fitz.Rect, min_iou: float = 0.05) -> bool:
+    inter = fitz.Rect(max(r1.x0, r2.x0), max(r1.y0, r2.y0), min(r1.x1, r2.x1), min(r1.y1, r2.y1))
+    if inter.x1 <= inter.x0 or inter.y1 <= inter.y0:
+        return False
+    inter_area = (inter.x1 - inter.x0) * (inter.y1 - inter.y0)
+    a1 = (r1.x1 - r1.x0) * (r1.y1 - r1.y0)
+    a2 = (r2.x1 - r2.x0) * (r2.y1 - r2.y0)
+    denom = max(a1 + a2 - inter_area, 1e-6)
+    iou = inter_area / denom
+    return iou >= min_iou
+
+def _collect_text_markup_annots(page: fitz.Page):
+    """Liste compacte d'annotations Text Markup → [{type, rect, color}]"""
     out = []
+    try:
+        annots = page.annots()
+    except Exception:
+        annots = None
+    if not annots:
+        return out
+
+    for a in annots:
+        try:
+            name = (getattr(a, "typeString", "") or "").lower()
+            if not any(k in name for k in ["highlight", "underline", "strike", "squiggly"]):
+                continue
+            color = None
+            try:
+                colors = getattr(a, "colors", None) or {}
+                color = colors.get("stroke", None)  # stroke color pour Highlight
+            except Exception:
+                pass
+
+            v = getattr(a, "vertices", None)
+            rects: List[fitz.Rect] = []
+            if v and hasattr(v, "__len__") and len(v) > 0:
+                # 3 formats possibles: Quads, Points (4*n), liste plate (8*n)
+                if hasattr(v[0], "rect"):
+                    rects = [q.rect for q in v]
+                elif hasattr(v[0], "x") and hasattr(v[0], "y"):
+                    for i in range(0, len(v), 4):
+                        if i + 3 < len(v):
+                            q = fitz.Quad([v[i], v[i+1], v[i+2], v[i+3]])
+                            rects.append(q.rect)
+                elif isinstance(v[0], (int, float)):
+                    for i in range(0, len(v), 8):
+                        if i + 7 < len(v):
+                            xs = v[i:i+8][0::2]; ys = v[i:i+8][1::2]
+                            rects.append(fitz.Rect(min(xs), min(ys), max(xs), max(ys)))
+            if not rects:
+                rects = [a.rect]
+
+            for r in rects:
+                out.append({"type": name, "rect": r, "color": color})
+        except Exception:
+            continue
+    return out
+
+def _collect_visual_highlights(page: fitz.Page):
+    """
+    Détecte des remplissages vectoriels (rectangles / paths remplis).
+    On utilise page.get_drawings(); sinon fallback bboxlog.
+    Renvoie [{rect, fill}] (fill = (r,g,b) 0..1 ou None).
+    """
+    visual = []
+    try:
+        drawings = page.get_drawings()  # chemins / rects / fill / stroke …
+        for d in drawings:
+            fill = d.get("fill")
+            if not fill:
+                continue
+            r = d.get("rect", None)
+            if r:
+                visual.append({"rect": r, "fill": fill})
+                continue
+            pts = []
+            for it in d.get("items", []):
+                ps = it[1] if len(it) > 1 else []
+                for p in ps:
+                    if hasattr(p, "x") and hasattr(p, "y"):
+                        pts.append((p.x, p.y))
+            if pts:
+                xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                visual.append({"rect": fitz.Rect(min(xs), min(ys), max(xs), max(ys)), "fill": fill})
+    except Exception:
+        # Fallback: opérations de remplissage (images / paths)
+        try:
+            for b in page.get_bboxlog():
+                if str(b.get("type", "")).startswith("fill"):
+                    bb = b.get("bbox")
+                    if bb and len(bb) == 4:
+                        visual.append({"rect": fitz.Rect(*bb), "fill": None})
+        except Exception:
+            pass
+    return visual
+
+def _spans_compacts(page: fitz.Page) -> List[Dict[str, Any]]:
+    """Texte compact + marquages (annotations & visuels)."""
+    spans: List[Dict[str, Any]] = []
+
+    # 1) spans texte
+    d = page.get_text("dict") or {}
     for bi, b in enumerate(d.get("blocks", []) or []):
-        if int(b.get("type", 0)) != 0:  # 0 = texte ; 1 = image
+        if int(b.get("type", 0)) != 0:   # 0 = texte ; 1 = image
             continue
         for li, l in enumerate(b.get("lines", []) or []):
             for si, s in enumerate(l.get("spans", []) or []):
-                text = s.get("text") or ""
-                if not text:
+                t = s.get("text") or ""
+                if not t:
                     continue
                 font = str(s.get("font") or "")
                 flags = int(s.get("flags") or 0)
@@ -71,14 +171,50 @@ def _spans_compacts(page: fitz.Page) -> List[Dict[str, Any]]:
                     color_rgb = list(fitz.sRGB_to_rgb(int(color))) if isinstance(color, int) else None
                 except Exception:
                     color_rgb = None
-                out.append({
+                spans.append({
                     "page": page.number + 1,
                     "block": bi, "line": li, "span": si,
-                    "text": text, "bbox": bbox,
+                    "text": t, "bbox": bbox,
                     "font": font, "size": s.get("size"),
                     "is_bold": is_bold, "color_rgb": color_rgb
                 })
-    return out
+
+    if not spans:
+        return spans
+
+    # 2) indices surlignage
+    annot_rects = _collect_text_markup_annots(page)   # quads → rects + color
+    visual_rects = _collect_visual_highlights(page)   # rectangles / paths remplis
+
+    for s in spans:
+        r = fitz.Rect(*s["bbox"])
+
+        # a) annotations PDF (Text Markup)
+        types, samples = set(), []
+        for a in annot_rects:
+            if _rects_overlap(r, a["rect"], min_iou=0.05):
+                types.add(a["type"])
+                samples.append({
+                    "bbox": [float(a["rect"].x0), float(a["rect"].y0), float(a["rect"].x1), float(a["rect"].y1)],
+                    "color_rgb": list(a["color"]) if a["color"] else None
+                })
+                if len(samples) >= 2:
+                    break
+        s["annot_mark"] = {"has": bool(types), "types": sorted(types), "samples": samples if types else []}
+
+        # b) surlignages visuels (remplissages)
+        vs = []
+        for v in visual_rects:
+            if _rects_overlap(r, v["rect"], min_iou=0.05):
+                vs.append({
+                    "bbox": [float(v["rect"].x0), float(v["rect"].y0), float(v["rect"].x1), float(v["rect"].y1)],
+                    "fill_rgb": list(v["fill"]) if v.get("fill") else None
+                })
+                if len(vs) >= 2:
+                    break
+        s["visual_mark"] = {"has": bool(vs), "samples": vs}
+
+    return spans
 
 # ---------- Error handlers ----------
 @app.errorhandler(400)
@@ -96,16 +232,16 @@ def handle_500(err):
 # ---------- Routes ----------
 @app.get("/")
 def health():
-    return jsonify({"status": "ok", "service": "pdf-annotations", "version": "1.4.0"}), 200
+    return jsonify({"status": "ok", "service": "pdf-annotations", "version": "1.5.0"}), 200
 
 @app.post("/parse")
 def parse_pdf():
     """
     Extraction native (pas d'OCR).
-      - compact=1  => renvoie une liste de spans compacts (recommandé LLM)
-      - pages=1-3,5  => filtre de pages
-      - truncate_span=200  => coupe le texte des spans
-      - debug=1  => renvoie l’erreur exacte au lieu d’un 500 muet
+      - compact=1             ⇒ spans compacts + marquages
+      - pages=1-3,5           ⇒ filtre de pages
+      - truncate_span=200     ⇒ coupe le texte des spans
+      - debug=1               ⇒ renvoie l’erreur exacte (diagnostic)
     """
     import json
 
@@ -117,7 +253,7 @@ def parse_pdf():
     debug = (q.get("debug") == "1")
 
     try:
-        # Lire PDF (binaire ou multipart)
+        # Lire PDF
         if request.content_type and "application/pdf" in (request.content_type or "").lower():
             pdf_bytes = request.get_data()
         else:
@@ -174,7 +310,7 @@ def parse_pdf():
                             s["text"] = s["text"][:truncate_span]
                 page_obj = {"number": pno, "spans": spans}
             else:
-                # version complète: rawdict + annotations text-markup
+                # version complète: rawdict + annotations
                 try:
                     raw = page.get_text("rawdict") or {}
                 except Exception:
@@ -212,6 +348,7 @@ def parse_pdf():
                             boxes, texts = [], []
                             if is_text_markup:
                                 v = getattr(a, "vertices", None)
+
                                 def add_rect(r: fitz.Rect):
                                     t = page.get_text("text", clip=r).strip()
                                     if t:
@@ -219,10 +356,12 @@ def parse_pdf():
                                             t = t[:truncate_span]
                                         texts.append(t)
                                         boxes.append([float(r.x0), float(r.y0), float(r.x1), float(r.y1)])
+
                                 try:
                                     if v:
                                         if hasattr(v, "__len__") and len(v) > 0 and hasattr(v[0], "rect"):
-                                            for q in v: add_rect(q.rect)
+                                            for q in v:
+                                                add_rect(q.rect)
                                         elif hasattr(v, "__len__") and len(v) > 0 and hasattr(v[0], "x") and hasattr(v[0], "y"):
                                             for i in range(0, len(v), 4):
                                                 if i + 3 < len(v):
@@ -237,10 +376,11 @@ def parse_pdf():
                                     if not texts:
                                         add_rect(a.rect)
                                 except Exception:
-                                    try: add_rect(a.rect)
-                                    except Exception: pass
+                                    try:
+                                        add_rect(a.rect)
+                                    except Exception:
+                                        pass
                             else:
-                                # Garde trace des autres annotations (Ink/Square/Polygon…) via bbox
                                 r = a.rect
                                 boxes.append([float(r.x0), float(r.y0), float(r.x1), float(r.y1)])
 
@@ -257,7 +397,7 @@ def parse_pdf():
 
             out_pages.append(page_obj)
 
-            # garde-fou taille
+            # Garde-fou taille
             try:
                 approx_bytes += len(json.dumps(_sanitize_json(page_obj), ensure_ascii=False))
                 if approx_bytes > BYTES_BUDGET:
@@ -265,7 +405,10 @@ def parse_pdf():
             except Exception:
                 pass
 
-        resp = {"meta": {"page_count": len(doc), "returned_pages": len(out_pages), "compact": compact}, "pages": out_pages}
+        resp = {
+            "meta": {"page_count": len(doc), "returned_pages": len(out_pages), "compact": compact},
+            "pages": out_pages
+        }
         resp = _sanitize_json(resp)
         return jsonify(resp), 200
 
@@ -277,7 +420,7 @@ def parse_pdf():
 
 @app.post("/extract")
 def extract():
-    """Highlights uniquement (texte sous les quads + couleur + bboxes + is_green)."""
+    """Highlights uniquement (texte sous quads + couleur + bboxes + is_green)."""
     try:
         if request.content_type and "application/pdf" in (request.content_type or "").lower():
             pdf_bytes = request.get_data()
@@ -318,7 +461,8 @@ def extract():
                 try:
                     if v:
                         if hasattr(v[0], "rect"):
-                            for q in v: add_text_from_rect(page, q.rect, texts, bboxes)
+                            for q in v:
+                                add_text_from_rect(page, q.rect, texts, bboxes)
                         elif hasattr(v[0], "x") and hasattr(v[0], "y"):
                             for i in range(0, len(v), 4):
                                 if i + 3 < len(v):
@@ -332,8 +476,10 @@ def extract():
                     if not texts:
                         add_text_from_rect(page, annot.rect, texts, bboxes)
                 except Exception:
-                    try: add_text_from_rect(page, annot.rect, texts, bboxes)
-                    except Exception: pass
+                    try:
+                        add_text_from_rect(page, annot.rect, texts, bboxes)
+                    except Exception:
+                        pass
                 if texts:
                     results.append({
                         "page": page_index + 1,
