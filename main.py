@@ -62,109 +62,140 @@ def health():
 @app.post("/parse")
 def parse_pdf():
     """
-    Tout le contenu *natif* d'un PDF :
-    - Texte structuré (blocks/lines/spans) via rawdict, avec bbox, police, taille, flags, couleur
-    - Toutes les annotations "Text Markup": Highlight / Underline / StrikeOut / Squiggly
-    NOTE: ne fait pas d'OCR (pour les scans -> passer par OCR côté Make)
+    Extraction *complète* du contenu natif:
+    - Texte structuré (blocks/lines/spans) via rawdict (bbox, font, size, flags, color)
+    - Toutes les annotations Text Markup (highlight / underline / strikeout / squiggly)
+    Ne fait PAS d'OCR (pour les scans -> OCR externe).
     """
-    # 1) Lire le PDF (binaire pur ou multipart 'file')
-    if request.content_type and "application/pdf" in request.content_type.lower():
-        pdf_bytes = request.get_data()
-    else:
-        f = request.files.get("file")
-        if not f:
-            return jsonify({"error": "No PDF provided (send as application/pdf, or multipart with field 'file')"}), 400
-        pdf_bytes = f.read()
-    if not pdf_bytes:
-        return jsonify({"error": "Empty request body"}), 400
-
-    # 2) Ouvrir avec PyMuPDF
     try:
-        doc = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
-    except Exception as e:
-        logger.exception("fitz.open failed (/parse)")
-        return jsonify({"error": f"Failed to open PDF: {e}"}), 400
+        # 1) Lire le PDF (binaire pur ou multipart 'file')
+        if request.content_type and "application/pdf" in request.content_type.lower():
+            pdf_bytes = request.get_data()
+        else:
+            f = request.files.get("file")
+            if not f:
+                return jsonify({"error": "No PDF provided (send as application/pdf, or multipart with field 'file')"}), 400
+            pdf_bytes = f.read()
+        if not pdf_bytes:
+            return jsonify({"error": "Empty request body"}), 400
 
-    out_pages = []
-    for pno in range(len(doc)):
-        page = doc[pno]
+        # 2) Ouvrir avec PyMuPDF
+        try:
+            doc = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
+        except Exception as e:
+            logger.exception("fitz.open failed (/parse)")
+            return jsonify({"error": f"Failed to open PDF: {e}"}), 400
 
-        # 3) Texte structuré (rawdict) : spans incluent font/size/flags/color/bbox
-        raw = page.get_text("rawdict")
-        # Ajouter is_bold (heuristique : font contient 'bold' ou flags != 0)
-        for b in raw.get("blocks", []):
-            for l in b.get("lines", []):
-                for s in l.get("spans", []):
-                    font = (s.get("font") or "").lower()
-                    flags = s.get("flags", 0)
-                    s["is_bold"] = ("bold" in font) or (flags != 0)
+        out_pages = []
+        for pno in range(len(doc)):
+            page = doc[pno]
 
-        # 4) Annotations : Text Markup (Highlight / Underline / StrikeOut / Squiggly)
-        annots_json = []
-        annots = page.annots()
-        if annots:
-            for a in annots:
-                name = (getattr(a, "typeString", "") or "").lower()
-                if not any(k in name for k in ["highlight", "underline", "strike", "squiggly"]):
-                    continue
+            # 3) Texte structuré (rawdict) – robustifié
+            try:
+                raw = page.get_text("rawdict") or {}
+            except Exception as e:
+                logger.exception("rawdict failed on page %s", pno + 1)
+                raw = {}
 
-                # couleur (pour highlight = stroke color)
-                color = None
-                try:
-                    colors = getattr(a, "colors", None) or {}
-                    color = colors.get("stroke", None)
-                except Exception:
-                    pass
+            # a) is_bold heuristique (en protégeant toutes les clés)
+            try:
+                for b in raw.get("blocks", []) or []:
+                    for l in b.get("lines", []) or []:
+                        for s in l.get("spans", []) or []:
+                            font = str(s.get("font") or "").lower()
+                            flags = int(s.get("flags") or 0)
+                            s["is_bold"] = ("bold" in font) or (flags != 0)
 
-                # texte sous les quads (tous formats possibles)
-                boxes, texts = [], []
-                v = getattr(a, "vertices", None)
+                # b) couleur des spans: rawdict renvoie en général un entier sRGB (RRGGBB)
+                # on laisse tel quel (JSON-safe). Si besoin de RGB 0..255:
+                # srgb = s.get("color"); if isinstance(srgb, int): rgb = fitz.sRGB_to_rgb(srgb)
+            except Exception:
+                logger.exception("post-process rawdict spans failed")
 
-                def add_rect(r: fitz.Rect):
-                    t = page.get_text("text", clip=r).strip()
-                    if t:
-                        texts.append(t)
-                        boxes.append([float(r.x0), float(r.y0), float(r.x1), float(r.y1)])
+            # 4) Annotations: Text Markup (toutes) – robustifiées
+            annots_json = []
+            try:
+                annots = page.annots()
+            except Exception:
+                annots = None
 
-                try:
-                    if v:
-                        if hasattr(v[0], "rect"):  # liste de fitz.Quad
-                            for q in v:
-                                add_rect(q.rect)
-                        elif hasattr(v[0], "x") and hasattr(v[0], "y"):  # Points
-                            for i in range(0, len(v), 4):
-                                if i + 3 < len(v):
-                                    q = fitz.Quad([v[i], v[i+1], v[i+2], v[i+3]])
-                                    add_rect(q.rect)
-                        elif isinstance(v[0], (int, float)):  # liste plate 8*n
-                            for i in range(0, len(v), 8):
-                                if i + 7 < len(v):
-                                    xs = v[i:i+8][0::2]; ys = v[i:i+8][1::2]
-                                    r = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
-                                    add_rect(r)
-                    if not texts:
-                        add_rect(a.rect)
-                except Exception:
+            if annots:
+                for a in annots:
                     try:
-                        add_rect(a.rect)
+                        name = (getattr(a, "typeString", "") or "").lower()
+                        if not any(k in name for k in ["highlight", "underline", "strike", "squiggly"]):
+                            continue
+
+                        # couleur (pour highlight, c'est la stroke color)
+                        color = None
+                        try:
+                            colors = getattr(a, "colors", None) or {}
+                            color = colors.get("stroke", None)  # ex. (r,g,b) 0..1
+                        except Exception:
+                            pass
+
+                        boxes, texts = [], []
+                        v = getattr(a, "vertices", None)
+
+                        def add_rect(r: fitz.Rect):
+                            try:
+                                t = page.get_text("text", clip=r).strip()
+                            except Exception:
+                                t = ""
+                            if t:
+                                texts.append(t)
+                                boxes.append([float(r.x0), float(r.y0), float(r.x1), float(r.y1)])
+
+                        try:
+                            if v:
+                                # cas 1 : liste de fitz.Quad
+                                if hasattr(v, "__len__") and len(v) > 0 and hasattr(v[0], "rect"):
+                                    for q in v:
+                                        add_rect(q.rect)
+                                # cas 2 : Points (4*n)
+                                elif hasattr(v, "__len__") and len(v) > 0 and hasattr(v[0], "x") and hasattr(v[0], "y"):
+                                    for i in range(0, len(v), 4):
+                                        if i + 3 < len(v):
+                                            q = fitz.Quad([v[i], v[i+1], v[i+2], v[i+3]])
+                                            add_rect(q.rect)
+                                # cas 3 : liste plate 8*n
+                                elif hasattr(v, "__len__") and len(v) >= 8 and isinstance(v[0], (int, float)):
+                                    for i in range(0, len(v), 8):
+                                        if i + 7 < len(v):
+                                            xs = v[i:i+8][0::2]; ys = v[i:i+8][1::2]
+                                            r = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
+                                            add_rect(r)
+                            if not texts:
+                                add_rect(a.rect)
+                        except Exception:
+                            try:
+                                add_rect(a.rect)
+                            except Exception:
+                                pass
+
+                        annots_json.append({
+                            "type": name,                               # "highlight" | "underline" | "strikeout" | "squiggly"
+                            "color_rgb": list(color) if color else None, # (r,g,b) 0..1 si fourni
+                            "boxes": boxes,
+                            "text": " ".join(texts).strip()
+                        })
                     except Exception:
-                        pass
+                        # On ignore cette annotation si elle est corrompue
+                        logger.exception("failed to process annotation on page %s", pno + 1)
 
-                annots_json.append({
-                    "type": name,  # "highlight" | "underline" | "strikeout" | "squiggly"
-                    "color_rgb": list(color) if color else None,
-                    "boxes": boxes,
-                    "text": " ".join(texts).strip()
-                })
+            out_pages.append({
+                "number": pno + 1,
+                "size": [float(page.rect.width), float(page.rect.height)],
+                "text_raw": raw,
+                "annotations": annots_json
+            })
 
-        out_pages.append({
-            "number": pno + 1,
-            "size": [float(page.rect.width), float(page.rect.height)],
-            "text_raw": raw,
-            "annotations": annots_json
-        })
+        return jsonify({"meta": {"page_count": len(doc)}, "pages": out_pages}), 200
 
-    return jsonify({"meta": {"page_count": len(doc)}, "pages": out_pages}), 200
+    except Exception as e:
+        logger.exception("Unhandled error in /parse")
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
 
 @app.post("/extract")
 def extract():
